@@ -111,7 +111,36 @@ func toType(t *rtype) Type {
 
 上述方法实现非常简单，就是将形参转换成 Type interface。这里设计成返回 interface 而不是返回 rtype 类型的数据结构是有讲究的。一是设计者不希望调用者拿到 rtype 滥用。毕竟类型信息这些都是只读的，在运行时被任意篡改太不安全了。二是设计者将调用者的需求的所有需求用 interface 这一层屏蔽了，Type interface 下层可以对应很多种类型，利用这个接口统一抽象成一层。
 
-值得说明的一点是 TypeOf() 入参，入参类型是 i interface{}，可以是 2 种类型，一种是 interface 变量，另外一种是具体的类型变量。如果 i 是具体的类型变量，TypeOf() 返回的具体类型信息；如果 i 是 interface 变量，并且绑定了具体类型对象实例，返回的是 i 绑定具体类型的动态类型信息；如果 i 没有绑定任何具体的类型对象实例，返回的是接口自身的静态类型信息。
+值得说明的一点是 TypeOf() 入参，入参类型是 i interface{}，可以是 2 种类型，一种是 interface 变量，另外一种是具体的类型变量。如果 i 是具体的类型变量，TypeOf() 返回的具体类型信息；如果 i 是 interface 变量，并且绑定了具体类型对象实例，返回的是 i 绑定具体类型的动态类型信息；如果 i 没有绑定任何具体的类型对象实例，返回的是接口自身的静态类型信息。例如下面这段代码：
+
+
+```go
+import (
+	"fmt"
+	"reflect"
+)
+
+func main() {
+	ifa := new(Person)
+	var ifb Person = Student{name: "halfrost"}
+    // 未绑定具体变量的接口类型 
+	fmt.Println(reflect.TypeOf(ifa).Elem().Name())
+	fmt.Println(reflect.TypeOf(ifa).Elem().Kind().String())
+    // 绑定具体变量的接口类型 
+	fmt.Println(reflect.TypeOf(ifb).Name())
+	fmt.Println(reflect.TypeOf(ifb).Kind().String())
+}
+```
+
+在第一组输出中，reflect.TypeOf() 入参未绑定具体变量的接口类型，所以返回的是接口类型本身 Person。对应的 Kind 是 interface。在第二组输出中，reflect.TypeOf() 入参绑定了具体变量的接口类型，所以返回的是绑定的具体类型 Student。对应的 Kind 是 struct。
+
+```go
+Person
+interface
+
+Student
+struct
+```
 
 
 下面来看看 Type interface 究竟涵盖了哪些有用的方法：
@@ -312,7 +341,7 @@ type Value struct {
 	//	- flagIndir:    val保存指向数据的指针
 	//	- flagAddr:     v.CanAddr 为 true (表示 flagIndir)
 	//	- flagMethod:   v 是方法值。
-        // 接下来的 5 个 bits 给出 Value 的 Kind 种类，除了方法 values 以外，它会重复 typ.Kind（）。其余 23 位以上给出方法 values 的方法编号。如果 flag.kind（）!= Func，代码可以假定 flagMethod 没有设置。如果 ifaceIndir(typ)，代码可以假定设置了 flagIndir。
+    // 接下来的 5 个 bits 给出 Value 的 Kind 种类，除了方法 values 以外，它会重复 typ.Kind（）。其余 23 位以上给出方法 values 的方法编号。如果 flag.kind（）!= Func，代码可以假定 flagMethod 没有设置。如果 ifaceIndir(typ)，代码可以假定设置了 flagIndir。
 	flag
 }
 ```
@@ -327,16 +356,178 @@ type Value struct {
 
 ## 三. 反射三定律
 
-著名的 《The laws of Reflection》 这篇文章里面归纳了反射的三定律。
+著名的 [《The laws of Reflection》](https://blog.golang.org/laws-of-reflection) 这篇文章里面归纳了反射的三定律。
 
 ### 1. 从接口值中得到反射对象
 
+
+![](https://img.halfrost.com/Blog/ArticleImage/148_1.png)
+
+
+- 通过实例获取 Value 对象，使用 reflect.ValueOf() 函数。
+
+```go
+// ValueOf returns a new Value initialized to the concrete value
+// stored in the interface i. ValueOf(nil) returns the zero Value.
+func ValueOf(i interface{}) Value {
+	if i == nil {
+		return Value{}
+	}
+	// TODO: Maybe allow contents of a Value to live on the stack.
+	// For now we make the contents always escape to the heap. It
+	// makes life easier in a few places (see chanrecv/mapassign
+	// comment below).
+	escapes(i)
+
+	return unpackEface(i)
+}
+```
+
+- 通过实例获取反射对象 Type，使用 reflect.TypeOf() 函数。
+
+
+```go
+// TypeOf returns the reflection Type that represents the dynamic type of i.
+// If i is a nil interface value, TypeOf returns nil.
+func TypeOf(i interface{}) Type {
+	eface := *(*emptyInterface)(unsafe.Pointer(&i))
+	return toType(eface.typ)
+}
+```
+
 ### 2. 从反射对象中获得接口值
+
+从 reflect.Value 数据结构可知，它包含了类型和值的信息，所以将 Value 转换成实例对象很容易。
+
+![](https://img.halfrost.com/Blog/ArticleImage/148_2.png)
+
+
+- 将 Value 转换成空的 interface，内部存放具体类型实例。使用 interface() 函数。
+
+```go
+// Interface returns v's current value as an interface{}.
+// It is equivalent to:
+//	var i interface{} = (v's underlying value)
+// It panics if the Value was obtained by accessing
+// unexported struct fields.
+func (v Value) Interface() (i interface{}) {
+	return valueInterface(v, true)
+}
+```
+
+- Value 也包含很多成员方法，可以将 Value 转换成简单类型实例，注意如果类型不匹配会 panic。
+
+```go
+// Int returns v's underlying value, as an int64.
+// It panics if v's Kind is not Int, Int8, Int16, Int32, or Int64.
+func (v Value) Int() int64 {
+	k := v.kind()
+	p := v.ptr
+	switch k {
+	case Int:
+		return int64(*(*int)(p))
+	case Int8:
+		return int64(*(*int8)(p))
+	case Int16:
+		return int64(*(*int16)(p))
+	case Int32:
+		return int64(*(*int32)(p))
+	case Int64:
+		return *(*int64)(p)
+	}
+	panic(&ValueError{"reflect.Value.Int", v.kind()})
+}
+
+// Uint returns v's underlying value, as a uint64.
+// It panics if v's Kind is not Uint, Uintptr, Uint8, Uint16, Uint32, or Uint64.
+func (v Value) Uint() uint64 {
+	k := v.kind()
+	p := v.ptr
+	switch k {
+	case Uint:
+		return uint64(*(*uint)(p))
+	case Uint8:
+		return uint64(*(*uint8)(p))
+	case Uint16:
+		return uint64(*(*uint16)(p))
+	case Uint32:
+		return uint64(*(*uint32)(p))
+	case Uint64:
+		return *(*uint64)(p)
+	case Uintptr:
+		return uint64(*(*uintptr)(p))
+	}
+	panic(&ValueError{"reflect.Value.Uint", v.kind()})
+}
+
+// Bool returns v's underlying value.
+// It panics if v's kind is not Bool.
+func (v Value) Bool() bool {
+	v.mustBe(Bool)
+	return *(*bool)(v.ptr)
+}
+
+// Float returns v's underlying value, as a float64.
+// It panics if v's Kind is not Float32 or Float64
+func (v Value) Float() float64 {
+	k := v.kind()
+	switch k {
+	case Float32:
+		return float64(*(*float32)(v.ptr))
+	case Float64:
+		return *(*float64)(v.ptr)
+	}
+	panic(&ValueError{"reflect.Value.Float", v.kind()})
+}
+```
 
 ### 3. 要修改反射对象，其值必须可以修改
 
 
 
+![](https://img.halfrost.com/Blog/ArticleImage/148_3.png)
+
+- 指针类型 Type 转成值类型 Type。指针类型必须是 \*Array、\*Slice、\*Pointer、\*Map、\*Chan 类型，否则会发生 panic。Type 返回的是内部元素的 Type。
+
+```go
+// Elem returns element type of array a.
+func (a *Array) Elem() Type { return a.elem }
+
+// Elem returns the element type of slice s.
+func (s *Slice) Elem() Type { return s.elem }
+
+// Elem returns the element type for the given pointer p.
+func (p *Pointer) Elem() Type { return p.base }
+
+// Elem returns the element type of map m.
+func (m *Map) Elem() Type { return m.elem }
+
+// Elem returns the element type of channel c.
+func (c *Chan) Elem() Type { return c.elem }
+```
+
+- 值类型 Type 转成指针类型 Type。PtrTo 返回的是指向 t 的指针类型 Type。
+
+```go
+// PtrTo returns the pointer type with element t.
+// For example, if t represents type Foo, PtrTo(t) represents *Foo.
+func PtrTo(t Type) Type {
+	return t.(*rtype).ptrTo()
+}
+```
+
+### 4. Type 和 Value 相互转换
+
+![](https://img.halfrost.com/Blog/ArticleImage/148_4.png)
+
+
+### 5. Value 指针转换成值
+
+![](https://img.halfrost.com/Blog/ArticleImage/148_5.png)
+
+### 6. 总结
+
+![](https://img.halfrost.com/Blog/ArticleImage/148_6.png)
 
 ## 四. 优缺点与最佳实践
 
